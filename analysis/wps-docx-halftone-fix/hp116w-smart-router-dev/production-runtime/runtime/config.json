@@ -1,0 +1,21 @@
+{
+  "runtime_schema": 1,
+  "profile": "production",
+  "python": "/usr/bin/python3",
+  "python_version": "3.9.6",
+  "site_packages": "/Library/Application Support/HP116W/runtime/site-packages",
+  "normalizer": "/Library/Application Support/HP116W/runtime/hp116w_normalize.py",
+  "ghostscript": "/usr/libexec/cups/filter/hp116w_gs",
+  "ghostscript_lib": "/usr/libexec/cups/filter/hp116w_gs_resources/share/ghostscript",
+  "cupsfilter": "/usr/sbin/cupsfilter",
+  "frozen_rastertoqpdl": "/usr/libexec/cups/filter/rastertoqpdl",
+  "cups_output": "raster",
+  "acceptance_mode": false,
+  "frozen_600": {
+    "input_rgb": 190.0,
+    "coverage_percent": 18.87627335852807,
+    "screen_lpi": 106.17,
+    "screen_angle_degrees": 45.0,
+    "target_pattern_sha256": "d761fb45b7360e3d62af6921a8b94cd116e93305c2a014937b892ec9ee395f07"
+  }
+}

@@ -1,0 +1,893 @@
+#!/usr/bin/python3
+"""Fail-closed CUPS PDF router for the HP116W smart queue.
+
+The router accepts the standard CUPS filter arguments, classifies the complete
+PDF, and produces one complete CUPS Raster stream on stdout.  It never writes
+diagnostics to stdout and never invokes a device encoder or backend.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import BinaryIO
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG = SCRIPT_DIR / "smart-router-config.json"
+INSTALLED_FILTER_DIR = Path("/usr/libexec/cups/filter")
+RASTER_MAGICS = {b"RaSt", b"tSaR", b"RaS2", b"2SaR", b"RaS3", b"3SaR"}
+GRAY_TOKEN = b"0.9098039 0.9098039 0.9098039 sc"
+SAFE_JOB = re.compile(r"[^A-Za-z0-9_.-]+")
+SUPPORTED_MEDIA_POINTS = ((612.0, 792.0), (595.0, 842.0))
+MEDIA_TOLERANCE_PT = 1.0
+
+
+class RouterError(RuntimeError):
+    """Expected fail-closed router error."""
+
+
+class RouterTimeout(RouterError):
+    """A child filter exceeded its bounded runtime."""
+
+
+class RouterInterrupted(RouterError):
+    """The scheduler or operator interrupted the router."""
+
+    def __init__(self, signum: int):
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
+
+
+def emit(event: str, **fields: object) -> None:
+    record = {
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
+        "event": event,
+        **fields,
+    }
+    print("HP116W_SMART " + json.dumps(record, ensure_ascii=False, default=str),
+          file=sys.stderr, flush=True)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def supported_media(width: float, height: float) -> bool:
+    return any(
+        abs(width - media_width) <= MEDIA_TOLERANCE_PT
+        and abs(height - media_height) <= MEDIA_TOLERANCE_PT
+        for media_width, media_height in SUPPORTED_MEDIA_POINTS
+    )
+
+
+def resolve_path(config_path: Path, value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = config_path.parent / path
+    return path.resolve()
+
+
+def load_config() -> tuple[Path, dict[str, object]]:
+    configured = os.environ.get("HP116W_SMART_CONFIG")
+    config_path = Path(configured or str(DEFAULT_CONFIG)).resolve()
+    # The production install is intentionally only three files (wrapper,
+    # router and PPD).  Do not make that install depend on a fourth JSON file:
+    # use a pinned production configuration when the filter is running from
+    # CUPS' allow-listed directory.  Offline tests pass an explicit fixture.
+    if not config_path.is_file() and (
+        os.environ.get("HP116W_SMART_INSTALLED") == "1"
+        or SCRIPT_DIR == INSTALLED_FILTER_DIR
+    ):
+        return Path("/usr/libexec/cups/filter/hp116w_smart_router"), {
+            "schema": 1,
+            "profile": "production",
+            "_builtin": True,
+            "native_cgpdftoraster": "/usr/libexec/cups/filter/cgpdftoraster",
+            "dispatcher_python": "/usr/bin/python3",
+            "dispatcher": "/usr/libexec/cups/filter/hp116w_wps_dispatcher",
+            "dispatcher_runtime_root": "/Library/Application Support/HP116W/runtime",
+            "dispatcher_ghostscript": "/usr/libexec/cups/filter/hp116w_gs",
+            "dispatcher_ghostscript_lib": "/usr/libexec/cups/filter/hp116w_gs_resources/share/ghostscript",
+            "baseline_raster_ppd": "/Library/Application Support/HP116W/baseline/HP116W_High_Quality_NATIVE.ppd",
+            "generic_600_enabled": True,
+            "generic_600_adapter": "/Library/Application Support/HP116W/runtime/hp116w_generic_600.py",
+            "generic_1200_enabled": True,
+            "generic_1200_adapter": "/Library/Application Support/HP116W/runtime/hp116w_generic_1200.py",
+            "log_dir": "/private/var/spool/cups/tmp/hp116w-smart-router-logs",
+            "dispatcher_log_dir": "/private/var/spool/cups/tmp/hp116w-smart-dispatcher-logs",
+            "timeout_seconds": 180,
+            "enforce_hashes": True,
+            "sha256": {
+                "native_cgpdftoraster": "7b0ab7ad0a10119123bbf47addb04801f896d494959632a27b22b86a68a1ff2b",
+                "dispatcher": "41f485968999d33d148c0e0edb7e11d303cb484d730cd54e84b731d8601d53c8",
+                "dispatcher_ghostscript": "a30b751e1261246c976526b8b9c5afbc007cefb67b9659a293e83b64afc26260",
+                "baseline_raster_ppd": "71af366af27d560f163b97054dd502e34240373ad0a9d365cd28660f4678616f",
+                "generic_600_adapter": "311dc1c403f1a0ebb223f5323729ff1b1cd2d532f2cbb8b76c71ebffc4245e29",
+                "generic_1200_adapter": "1e9d62bd8434a54e4e339538e0036b91ff0073b3eee7ba6e2226a99ef10d9d01",
+            },
+        }
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RouterError(f"cannot load smart router config: {exc}") from exc
+    if config.get("schema") != 1 or config.get("profile") not in {"production", "offline-test"}:
+        raise RouterError("invalid smart router profile")
+    if (os.environ.get("HP116W_SMART_INSTALLED") == "1" or SCRIPT_DIR == INSTALLED_FILTER_DIR) and config.get("profile") != "production":
+        raise RouterError("installed router requires production profile")
+    return config_path, config
+
+
+def configured_path(config_path: Path, config: dict[str, object], key: str) -> Path:
+    value = config.get(key)
+    if not isinstance(value, str) or not value:
+        raise RouterError(f"missing config path: {key}")
+    return resolve_path(config_path, value)
+
+
+def validate_runtime(config_path: Path, config: dict[str, object]) -> dict[str, Path]:
+    path_keys = [
+        "native_cgpdftoraster",
+        "dispatcher_python",
+        "dispatcher",
+        "dispatcher_runtime_root",
+        "dispatcher_ghostscript",
+        "dispatcher_ghostscript_lib",
+        "baseline_raster_ppd",
+    ]
+    generic_enabled = bool(config.get("generic_600_enabled", False))
+    generic_1200_enabled = bool(config.get("generic_1200_enabled", False))
+
+    def disable_generic(reason: str) -> None:
+        """Keep a bad optional adapter from blocking the native route."""
+        nonlocal generic_enabled
+        generic_enabled = False
+        config["generic_600_enabled"] = False
+        config["generic_600_disabled_reason"] = reason
+        emit("GENERIC_DISABLED_NATIVE_FALLBACK", reason=reason)
+
+    def disable_generic_1200(reason: str) -> None:
+        """Keep the optional 1200 enhancement fail-closed to native."""
+        nonlocal generic_1200_enabled
+        generic_1200_enabled = False
+        config["generic_1200_enabled"] = False
+        config["generic_1200_disabled_reason"] = reason
+        emit("GENERIC_1200_DISABLED_NATIVE_FALLBACK", reason=reason)
+
+    # The generic renderer is an optional 600 dpi enhancement.  A missing or
+    # malformed adapter must therefore disable only that enhancement and let
+    # the established native path continue.
+    generic_value = config.get("generic_600_adapter")
+    if generic_enabled and (not isinstance(generic_value, str) or not generic_value):
+        disable_generic("generic_600_adapter is missing from config")
+    if generic_enabled:
+        path_keys.append("generic_600_adapter")
+    generic_1200_value = config.get("generic_1200_adapter")
+    if generic_1200_enabled and (not isinstance(generic_1200_value, str) or not generic_1200_value):
+        disable_generic_1200("generic_1200_adapter is missing from config")
+    if generic_1200_enabled:
+        path_keys.append("generic_1200_adapter")
+    paths = {key: configured_path(config_path, config, key) for key in path_keys}
+    files = (
+        "native_cgpdftoraster",
+        "dispatcher_python",
+        "dispatcher",
+        "dispatcher_ghostscript",
+        "baseline_raster_ppd",
+    )
+    for key in files:
+        if not paths[key].is_file():
+            raise RouterError(f"configured file is missing: {key}={paths[key]}")
+    if generic_enabled and not paths["generic_600_adapter"].is_file():
+        disable_generic(
+            "configured file is missing: generic_600_adapter="
+            f"{paths['generic_600_adapter']}"
+        )
+    if generic_1200_enabled and not paths["generic_1200_adapter"].is_file():
+        disable_generic_1200(
+            "configured file is missing: generic_1200_adapter="
+            f"{paths['generic_1200_adapter']}"
+        )
+    if not paths["baseline_raster_ppd"].is_file() or not os.access(paths["baseline_raster_ppd"], os.R_OK):
+        raise RouterError("baseline PPD is not a readable regular file")
+    for key in ("native_cgpdftoraster", "dispatcher_python", "dispatcher_ghostscript"):
+        if not os.access(paths[key], os.X_OK):
+            raise RouterError(f"configured executable is not executable: {key}={paths[key]}")
+    for key in ("dispatcher_runtime_root", "dispatcher_ghostscript_lib"):
+        if not paths[key].is_dir():
+            raise RouterError(f"configured directory is missing: {key}={paths[key]}")
+
+    if config.get("enforce_hashes", False):
+        expected = config.get("sha256")
+        if not isinstance(expected, dict):
+            raise RouterError("hash enforcement is enabled without sha256 pins")
+        if not config.get("_builtin"):
+            own_expected = expected.get("smart_router")
+            own_actual = sha256_file(Path(__file__).resolve())
+            if not isinstance(own_expected, str) or own_actual != own_expected:
+                raise RouterError(
+                    f"hash mismatch: smart_router expected={own_expected} actual={own_actual}"
+                )
+        for key in ("native_cgpdftoraster", "dispatcher", "dispatcher_ghostscript", "baseline_raster_ppd"):
+            wanted = expected.get(key)
+            actual = sha256_file(paths[key])
+            if not isinstance(wanted, str) or actual != wanted:
+                raise RouterError(f"hash mismatch: {key} expected={wanted} actual={actual}")
+        if generic_enabled:
+            wanted = expected.get("generic_600_adapter")
+            try:
+                actual = sha256_file(paths["generic_600_adapter"])
+            except OSError as exc:
+                disable_generic(f"cannot hash generic_600_adapter: {exc}")
+            else:
+                if not isinstance(wanted, str) or actual != wanted:
+                    disable_generic(
+                        "hash mismatch: generic_600_adapter "
+                        f"expected={wanted} actual={actual}"
+                    )
+        if generic_1200_enabled:
+            wanted = expected.get("generic_1200_adapter")
+            try:
+                actual = sha256_file(paths["generic_1200_adapter"])
+            except OSError as exc:
+                disable_generic_1200(f"cannot hash generic_1200_adapter: {exc}")
+            else:
+                if not isinstance(wanted, str) or actual != wanted:
+                    disable_generic_1200(
+                        "hash mismatch: generic_1200_adapter "
+                        f"expected={wanted} actual={actual}"
+                    )
+    return paths
+
+
+def load_generic_adapter(path: Path):
+    """Load the pinned generic adapter without importing development modules."""
+    spec = importlib.util.spec_from_file_location("hp116w_generic_600", path)
+    if spec is None or spec.loader is None:
+        raise RouterError(f"cannot load generic adapter: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in ("pdf_features", "classify_pdf", "render_generic"):
+        if not callable(getattr(module, name, None)):
+            raise RouterError(f"generic adapter missing callable: {name}")
+    return module
+
+
+def six_hundred_request(filter_args: list[str]) -> tuple[bool, str]:
+    """Gate generic opt-in to the named 600 dpi fixed queue only."""
+    queue = os.environ.get("PRINTER", "").strip()
+    if queue != "HP116W_600dpi":
+        return False, f"queue={queue or 'unset'} is not HP116W_600dpi"
+    if len(filter_args) < 5:
+        return False, "missing CUPS options"
+    options = filter_args[4] or ""
+    explicit: list[tuple[str, int]] = []
+    for raw in re.split(r"[\s,]+", options.strip()):
+        if not raw or "=" not in raw:
+            continue
+        name, token = raw.split("=", 1)
+        key = name.lower()
+        if key not in {"resolution", "quality", "cupsprintquality"}:
+            continue
+        token = token.strip().strip('"').lower()
+        if key == "cupsprintquality":
+            if token == "normal":
+                dpi = 600
+            elif token == "high":
+                dpi = 1200
+            else:
+                match = re.fullmatch(r"([0-9]+)(?:x[0-9]+)?(?:dpi)?", token)
+                if not match:
+                    return False, f"unsupported explicit quality={token}"
+                dpi = int(match.group(1))
+        else:
+            if token in {"normal", "standard"}:
+                dpi = 600
+            elif token in {"high", "best"}:
+                dpi = 1200
+            else:
+                match = re.fullmatch(r"([0-9]+)(?:x[0-9]+)?(?:dpi)?", token)
+                if not match:
+                    return False, f"unsupported explicit {name}={token}"
+                dpi = int(match.group(1))
+        explicit.append((name, dpi))
+    if explicit and ({dpi for _, dpi in explicit} != {600}):
+        return False, f"explicit resolution conflict={explicit}"
+    return True, "fixed queue and explicit options resolve to 600dpi"
+
+
+def twelve_hundred_request(filter_args: list[str]) -> tuple[bool, str]:
+    """Gate 1200 Generic by its dedicated production queue."""
+    queue = os.environ.get("PRINTER", "").strip()
+    if queue != "HP116W_1200dpi":
+        return False, f"queue={queue or 'unset'} is not HP116W_1200dpi"
+    if len(filter_args) < 5:
+        return False, "missing CUPS options"
+    options = filter_args[4] or ""
+    explicit: list[tuple[str, int]] = []
+    for raw in re.split(r"[\s,]+", options.strip()):
+        if not raw or "=" not in raw:
+            continue
+        name, token = raw.split("=", 1)
+        key = name.lower()
+        if key not in {"resolution", "quality", "cupsprintquality"}:
+            continue
+        token = token.strip().strip('"').lower()
+        if key == "cupsprintquality":
+            if token == "normal":
+                dpi = 600
+            elif token == "high":
+                dpi = 1200
+            else:
+                match = re.fullmatch(r"([0-9]+)(?:x[0-9]+)?(?:dpi)?", token)
+                if not match:
+                    return False, f"unsupported explicit quality={token}"
+                dpi = int(match.group(1))
+        else:
+            if token in {"normal", "standard"}:
+                dpi = 600
+            elif token in {"high", "best"}:
+                dpi = 1200
+            else:
+                match = re.fullmatch(r"([0-9]+)(?:x[0-9]+)?(?:dpi)?", token)
+                if not match:
+                    return False, f"unsupported explicit {name}={token}"
+                dpi = int(match.group(1))
+        explicit.append((name, dpi))
+    if not explicit:
+        return True, "production queue resolves to 1200dpi without explicit options"
+    if {dpi for _, dpi in explicit} != {1200}:
+        return False, f"explicit resolution conflict={explicit}"
+    return True, "production queue and explicit options resolve to 1200dpi"
+
+
+def copy_stdin_to_pdf(destination: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    total = 0
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            while True:
+                chunk = sys.stdin.buffer.read(1024 * 1024)
+                if not chunk:
+                    break
+                stream.write(chunk)
+                digest.update(chunk)
+                total += len(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
+    return total, digest.hexdigest()
+
+
+def input_pdf(filter_args: list[str], work: Path) -> tuple[Path, str, int, str]:
+    if len(filter_args) == 6 and filter_args[5] not in {"", "-"}:
+        path = Path(filter_args[5])
+        if not path.is_file():
+            raise RouterError(f"input PDF does not exist: {path}")
+        size = path.stat().st_size
+        digest = sha256_file(path) if size else hashlib.sha256(b"").hexdigest()
+        mode = "filename"
+    else:
+        path = work / "input.pdf"
+        size, digest = copy_stdin_to_pdf(path)
+        mode = "stdin"
+    if size == 0:
+        raise RouterError("empty PDF input")
+    return path, mode, size, digest
+
+
+def dereference(value: object) -> object:
+    try:
+        return value.get_object()  # type: ignore[attr-defined]
+    except AttributeError:
+        return value
+
+
+def colorspace_text(resources: object) -> str:
+    resources = dereference(resources)
+    if not isinstance(resources, dict):
+        return ""
+    colorspaces = dereference(resources.get("/ColorSpace", {}))
+    if isinstance(colorspaces, dict):
+        return " ".join(str(dereference(value)) for value in colorspaces.values())
+    return str(colorspaces)
+
+
+def classify_pdf(path: Path, runtime_root: Path) -> dict[str, object]:
+    site_packages = runtime_root / "site-packages"
+    if not site_packages.is_dir():
+        raise RouterError(f"detector site-packages missing: {site_packages}")
+    site_text = str(site_packages)
+    if site_text not in sys.path:
+        sys.path.insert(0, site_text)
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:
+        raise RouterError(f"cannot load pinned PDF detector: {exc}") from exc
+
+    try:
+        reader = PdfReader(str(path), strict=False)
+        if not reader.pages:
+            raise ValueError("PDF has no pages")
+        metadata = reader.metadata or {}
+        document_signals = {
+            "creator_wps": str(metadata.get("/Creator", "")).startswith("WPS Office"),
+            "title_docx": str(metadata.get("/Title", "")).lower().endswith(".docx"),
+            "producer_quartz": "Quartz PDFContext" in str(metadata.get("/Producer", "")),
+        }
+        page_signals: list[dict[str, object]] = []
+        matching_pages: list[int] = []
+        target_gray_pages: list[int] = []
+        for number, page in enumerate(reader.pages, start=1):
+            width = float(page.mediabox.width)
+            height = float(page.mediabox.height)
+            resources = dereference(page.get("/Resources", {}))
+            xobjects: object = {}
+            if isinstance(resources, dict):
+                xobjects = dereference(resources.get("/XObject", {}))
+            contents = page.get_contents()
+            content = contents.get_data() if contents is not None else b""
+            signals = {
+                "page": number,
+                "media_points": [width, height],
+                # Keep the historical field name for report compatibility;
+                # it now means one of the supported portrait media sizes.
+                "letter_media": supported_media(width, height),
+                "iccbased_rgb": "/ICCBased" in colorspace_text(resources),
+                "vector_only": isinstance(xobjects, dict) and len(xobjects) == 0,
+                "neutral_gray_signal": GRAY_TOKEN in content,
+                "content_bytes": len(content),
+            }
+            page_signals.append(signals)
+            if all(bool(signals[key]) for key in ("letter_media", "iccbased_rgb", "vector_only")):
+                matching_pages.append(number)
+            if signals["neutral_gray_signal"]:
+                target_gray_pages.append(number)
+        decision = "PASS" if all(document_signals.values()) and matching_pages else "BYPASS"
+        return {
+            "decision": decision,
+            "confidence": 0.98 if decision == "PASS" else 0.0,
+            "document_signals": document_signals,
+            "page_count": len(reader.pages),
+            "matching_pages": matching_pages,
+            "target_gray_pages": target_gray_pages,
+            "pages": page_signals,
+        }
+    except RouterError:
+        raise
+    except Exception as exc:
+        raise RouterError(f"PDF detector failed: {type(exc).__name__}: {exc}") from exc
+
+
+def terminate_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=2.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def relay_stderr(path: Path) -> None:
+    if not path.is_file():
+        return
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            sys.stderr.buffer.write(chunk)
+    sys.stderr.buffer.flush()
+
+
+def run_filter(command: list[str], environment: dict[str, str], output: Path,
+               child_stderr: Path, timeout_seconds: float) -> None:
+    process: subprocess.Popen[bytes] | None = None
+    old_handlers: dict[int, object] = {}
+
+    def interrupted(signum: int, _frame: object) -> None:
+        raise RouterInterrupted(signum)
+
+    try:
+        with output.open("xb") as stdout_stream, child_stderr.open("xb") as stderr_stream:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_stream,
+                stderr=stderr_stream,
+                env=environment,
+                close_fds=True,
+                start_new_session=True,
+            )
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                old_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, interrupted)
+            try:
+                returncode = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                terminate_group(process)
+                raise RouterTimeout(f"child filter timeout after {timeout_seconds:g}s") from exc
+            except RouterInterrupted:
+                terminate_group(process)
+                raise
+        relay_stderr(child_stderr)
+        if returncode != 0:
+            raise RouterError(f"child filter exited with status {returncode}")
+    finally:
+        if process is not None and process.poll() is None:
+            terminate_group(process)
+        for signum, handler in old_handlers.items():
+            signal.signal(signum, handler)  # type: ignore[arg-type]
+
+
+def validate_raster(path: Path) -> tuple[int, str, str]:
+    size = path.stat().st_size if path.is_file() else 0
+    if size <= 4:
+        raise RouterError("child produced empty or truncated raster output")
+    with path.open("rb") as stream:
+        magic = stream.read(4)
+    if magic not in RASTER_MAGICS:
+        if magic.startswith(b"\x1b%"):
+            raise RouterError("child produced SPL3/PJL instead of CUPS Raster")
+        raise RouterError(f"child produced invalid CUPS Raster magic: {magic!r}")
+    return size, sha256_file(path), magic.decode("ascii")
+
+
+def canonicalize_raster(source: Path, destination: Path) -> dict[str, object]:
+    """Validate a Raster stream and collapse legacy per-page stream magics.
+
+    The selective dispatcher returns one independently valid
+    Raster stream per selected page.  CUPS requires a single stream magic
+    followed by N page headers, so the router owns this stream-level adapter
+    without changing any page header or bitmap byte.
+    """
+    magic_to_format = {
+        b"RaSt": (">", 420),
+        b"tSaR": ("<", 420),
+        b"RaS2": (">", 1796),
+        b"2SaR": ("<", 1796),
+        b"RaS3": (">", 1796),
+        b"3SaR": ("<", 1796),
+    }
+    duplicate_magics = 0
+    pages: list[dict[str, int]] = []
+    try:
+        with source.open("rb") as input_stream, destination.open("xb") as output_stream:
+            magic = input_stream.read(4)
+            if magic not in magic_to_format:
+                raise RouterError(f"child produced invalid CUPS Raster magic: {magic!r}")
+            endian, header_size = magic_to_format[magic]
+            output_stream.write(magic)
+            while True:
+                prefix = input_stream.read(4)
+                if not prefix:
+                    break
+                if prefix in magic_to_format:
+                    if prefix != magic:
+                        raise RouterError("mixed CUPS Raster stream formats")
+                    duplicate_magics += 1
+                    prefix = input_stream.read(4)
+                    if len(prefix) != 4:
+                        raise RouterError("truncated page header after Raster stream magic")
+                remainder = input_stream.read(header_size - 4)
+                if len(remainder) != header_size - 4:
+                    raise RouterError("truncated CUPS Raster page header")
+                header = prefix + remainder
+                width = struct.unpack_from(endian + "I", header, 372)[0]
+                height = struct.unpack_from(endian + "I", header, 376)[0]
+                bytes_per_line = struct.unpack_from(endian + "I", header, 392)[0]
+                if width <= 0 or height <= 0 or bytes_per_line <= 0:
+                    raise RouterError("invalid CUPS Raster page geometry")
+                payload_bytes = height * bytes_per_line
+                output_stream.write(header)
+                remaining = payload_bytes
+                while remaining:
+                    chunk = input_stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise RouterError("truncated CUPS Raster page payload")
+                    output_stream.write(chunk)
+                    remaining -= len(chunk)
+                pages.append({
+                    "width": width,
+                    "height": height,
+                    "bytes_per_line": bytes_per_line,
+                    "payload_bytes": payload_bytes,
+                })
+            if not pages:
+                raise RouterError("CUPS Raster stream contains no pages")
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+    except BaseException:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
+    return {
+        "page_count": len(pages),
+        "pages": pages,
+        "duplicate_stream_magics_removed": duplicate_magics,
+    }
+
+
+def atomic_report(log_dir: Path, job_id: str, report: dict[str, object]) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    safe_job = SAFE_JOB.sub("_", job_id) or "unknown"
+    destination = log_dir / f"job-{safe_job}.json"
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=log_dir)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(report, stream, ensure_ascii=False, indent=2, default=str)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def commit_stdout(path: Path) -> None:
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+    sys.stdout.buffer.flush()
+
+
+def main() -> int:
+    filter_args = sys.argv[1:]
+    if len(filter_args) not in {5, 6}:
+        emit("ROUTER_ABORT", reason="expected five or six CUPS filter arguments",
+             argv_count=len(filter_args))
+        return 2
+
+    job_id = filter_args[0]
+    report: dict[str, object] = {
+        "schema": 1,
+        "job_id": job_id,
+        "status": "FAIL",
+        "stdout_commit": False,
+        "router_invoked_device_encoder": False,
+        "network_sent": False,
+    }
+    log_dir: Path | None = None
+    try:
+        config_path, config = load_config()
+        paths = validate_runtime(config_path, config)
+        timeout_seconds = float(os.environ.get(
+            "HP116W_SMART_TIMEOUT_SECONDS", str(config.get("timeout_seconds", 180))))
+        if timeout_seconds <= 0:
+            raise RouterError("timeout_seconds must be positive")
+        log_value = os.environ.get(
+            "HP116W_SMART_LOG_DIR",
+            str(config.get("log_dir", "/private/var/spool/cups/tmp/hp116w-smart-router-logs")),
+        )
+        log_dir = resolve_path(config_path, log_value)
+
+        with tempfile.TemporaryDirectory(prefix="hp116w-smart-router-") as temporary_root:
+            work = Path(temporary_root)
+            pdf, input_mode, input_bytes, input_sha = input_pdf(filter_args, work)
+            report.update({
+                "input_mode": input_mode,
+                "input_bytes": input_bytes,
+                "input_sha256": input_sha,
+            })
+            detector = classify_pdf(pdf, paths["dispatcher_runtime_root"])
+            report["detector"] = detector
+            decision = str(detector["decision"])
+            eligible_600, _ = six_hundred_request(filter_args)
+            if (
+                decision == "PASS"
+                and eligible_600
+                and bool(config.get("generic_600_enabled", False))
+                and not detector["target_gray_pages"]
+            ):
+                decision = "BYPASS"
+                report["wps_selective_600_skip"] = "no target gray; defer to 600dpi generic classifier"
+            emit("DETECTOR_DONE", job_id=job_id, decision=decision,
+                 page_count=detector["page_count"])
+
+            normalized_args = [*filter_args[:5], str(pdf)]
+            environment = os.environ.copy()
+            environment["PYTHONNOUSERSITE"] = "1"
+            output = work / "candidate.raster"
+            child_stderr = work / "child.stderr"
+            output_ready = False
+
+            if decision == "PASS":
+                wps_1200, wps_gate_reason = twelve_hundred_request(filter_args)
+                branch = "WPS_SELECTIVE_1200" if wps_1200 else "WPS_SELECTIVE"
+                report["wps_gate"] = {
+                    "1200": wps_1200,
+                    "reason": wps_gate_reason,
+                }
+                dispatcher_logs_value = os.environ.get(
+                    "HP116W_SMART_DISPATCHER_LOG_DIR",
+                    str(config.get(
+                        "dispatcher_log_dir",
+                        "/private/var/spool/cups/tmp/hp116w-smart-dispatcher-logs",
+                    )),
+                )
+                dispatcher_logs = resolve_path(config_path, dispatcher_logs_value)
+                dispatcher_logs.mkdir(parents=True, exist_ok=True)
+                environment.update({
+                    "HP116W_DISPATCH_OUTPUT": "raster",
+                    "HP116W_RUNTIME_ROOT": str(paths["dispatcher_runtime_root"]),
+                    "HP116W_GS": str(paths["dispatcher_ghostscript"]),
+                    "HP116W_GS_LIB": str(paths["dispatcher_ghostscript_lib"]),
+                    "HP116W_DISPATCHER_LOG_DIR": str(dispatcher_logs),
+                    "HP116W_ACCEPTANCE_MODE": str(config.get("dispatcher_acceptance_mode", False)).lower(),
+                    "PPD": str(paths["baseline_raster_ppd"]),
+                })
+                command = [str(paths["dispatcher_python"]), str(paths["dispatcher"]), *normalized_args]
+                child_name = "hp116w_wps_dispatcher"
+            else:
+                branch = "NATIVE_BYPASS"
+                command = [str(paths["native_cgpdftoraster"]), *normalized_args]
+                child_name = "cgpdftoraster"
+                generic_error: str | None = None
+                generic_enabled = bool(config.get("generic_600_enabled", False))
+                generic_1200_enabled = bool(config.get("generic_1200_enabled", False))
+                eligible_600, gate_reason_600 = six_hundred_request(filter_args)
+                eligible_1200, gate_reason_1200 = twelve_hundred_request(filter_args)
+                report["generic_gate"] = {
+                    "600": {
+                        "enabled": generic_enabled,
+                        "eligible": eligible_600 and generic_enabled,
+                        "reason": gate_reason_600 if generic_enabled else "generic 600 opt-in disabled",
+                    },
+                    "1200": {
+                        "enabled": generic_1200_enabled,
+                        "eligible": eligible_1200 and generic_1200_enabled,
+                        "reason": gate_reason_1200 if generic_1200_enabled else "generic 1200 opt-in disabled",
+                    },
+                }
+                if eligible_1200 and not generic_1200_enabled:
+                    raise RouterError(
+                        "Generic 1200 is unavailable for an HP116W_1200dpi request; "
+                        "refusing native 600dpi fallback"
+                    )
+                selected_adapter: str | None = None
+                selected_route: str | None = None
+                if generic_1200_enabled and eligible_1200:
+                    selected_adapter = "generic_1200_adapter"
+                    selected_route = "GENERIC_RGB235_1200"
+                elif generic_enabled and eligible_600:
+                    selected_adapter = "generic_600_adapter"
+                    selected_route = "GENERIC_HIGHLIGHT_A"
+                if selected_adapter is not None:
+                    try:
+                        adapter = load_generic_adapter(paths[selected_adapter])
+                        features = adapter.pdf_features(pdf)
+                        classification = adapter.classify_pdf(features)
+                        report["generic_classifier"] = classification
+                        if classification.get("route") == selected_route:
+                            ppd_value = environment.get("PPD") or str(paths["baseline_raster_ppd"])
+                            generic_result = adapter.render_generic(
+                                pdf,
+                                normalized_args,
+                                output,
+                                paths["native_cgpdftoraster"],
+                                paths["dispatcher_ghostscript"],
+                                paths["dispatcher_ghostscript_lib"],
+                                Path(ppd_value),
+                                timeout_seconds,
+                            )
+                            branch = str(selected_route)
+                            child_name = "hp116w_generic_1200" if selected_adapter == "generic_1200_adapter" else "hp116w_generic_600"
+                            report["generic_render"] = generic_result
+                            output_ready = True
+                        else:
+                            report["generic_fallback"] = "classifier selected NATIVE"
+                            if selected_adapter == "generic_1200_adapter":
+                                raise RouterError(
+                                    "Generic 1200 classifier declined the requested route; "
+                                    "refusing native 600dpi fallback"
+                                )
+                    except Exception as exc:
+                        generic_error = f"{type(exc).__name__}: {exc}"
+                        report["generic_fallback"] = generic_error
+                        if selected_adapter == "generic_1200_adapter":
+                            emit("GENERIC_1200_ABORT", job_id=job_id, reason=generic_error)
+                            raise RouterError(
+                                f"Generic 1200 rendering failed: {generic_error}"
+                            ) from exc
+                        emit("GENERIC_FALLBACK_NATIVE", job_id=job_id, reason=generic_error)
+                if generic_error is not None or not output_ready:
+                    if eligible_1200:
+                        raise RouterError(
+                            "Generic 1200 produced no raster for an HP116W_1200dpi request; "
+                            "refusing native 600dpi fallback"
+                        )
+                    branch = "NATIVE_BYPASS"
+                    command = [str(paths["native_cgpdftoraster"]), *normalized_args]
+                    child_name = "cgpdftoraster"
+
+            report.update({"branch": branch, "child": child_name, "child_argv": normalized_args})
+            if not output_ready:
+                emit("CHILD_START", job_id=job_id, branch=branch, child=child_name)
+                run_filter(command, environment, output, child_stderr, timeout_seconds)
+            canonical_output = work / "canonical.raster"
+            raster_details = canonicalize_raster(output, canonical_output)
+            output_bytes, output_sha, magic = validate_raster(canonical_output)
+            report.update({
+                "status": "PASS",
+                "output_mime": "application/vnd.cups-raster",
+                "output_bytes": output_bytes,
+                "output_sha256": output_sha,
+                "raster_magic": magic,
+                "raster": raster_details,
+            })
+            report_path = atomic_report(log_dir, job_id, report)
+            emit("OUTPUT_VALIDATED", job_id=job_id, branch=branch,
+                 output_bytes=output_bytes, output_sha256=output_sha,
+                 report=str(report_path))
+            commit_stdout(canonical_output)
+            report["stdout_commit"] = True
+            try:
+                atomic_report(log_dir, job_id, report)
+            except Exception as report_exc:
+                emit("POST_COMMIT_REPORT_WRITE_FAILED", job_id=job_id, reason=repr(report_exc))
+            # The pre-commit report is the durable proof that all validation
+            # gates completed before the first stdout byte.  Commit completion
+            # is also emitted to the scheduler-owned stderr stream.
+            emit("STDOUT_COMMIT_DONE", job_id=job_id, output_bytes=output_bytes)
+        return 0
+    except RouterInterrupted as exc:
+        report.update({"error": str(exc), "signal": exc.signum})
+        emit("ROUTER_ABORT", job_id=job_id, reason=str(exc))
+        return 128 + exc.signum
+    except RouterTimeout as exc:
+        report["error"] = str(exc)
+        emit("ROUTER_ABORT", job_id=job_id, reason=str(exc))
+        return 124
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        emit("ROUTER_ABORT", job_id=job_id, reason=report["error"])
+        return 1
+    finally:
+        if log_dir is not None and report.get("status") != "PASS":
+            try:
+                atomic_report(log_dir, job_id, report)
+            except Exception as log_exc:
+                emit("REPORT_WRITE_FAILED", job_id=job_id, reason=repr(log_exc))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

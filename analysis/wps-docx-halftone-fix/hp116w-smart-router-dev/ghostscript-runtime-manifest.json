@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "profile": "production-candidate",
+  "version": "10.07.1",
+  "architecture": "arm64",
+  "provenance": "read-only copy of the CUPS-sandbox-validated self-contained runtime",
+  "binary": {
+    "source": "production-runtime/ghostscript/bin/gs",
+    "install_path": "/usr/libexec/cups/filter/hp116w_gs",
+    "sha256": "a30b751e1261246c976526b8b9c5afbc007cefb67b9659a293e83b64afc26260",
+    "bytes": 15829856,
+    "mode": "0755"
+  },
+  "resources": {
+    "source": "production-runtime/ghostscript/resources",
+    "install_path": "/usr/libexec/cups/filter/hp116w_gs_resources",
+    "tree_sha256": "cfb5257bf798aeca329ceeccf57bc5a488af91bc1b5fbfedfb2eb6a240aa4375",
+    "tree_sha256_algorithm": "sha256 over sorted files: length-prefixed relative path, length-prefixed content, raw content sha256",
+    "file_count": 590,
+    "ghostscript_lib_path": "/usr/libexec/cups/filter/hp116w_gs_resources/share/ghostscript"
+  },
+  "direct_dependencies": [
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libjbig2dec.0.dylib", "sha256": "0ad71d8a207fc2dae9ede13da4c24499d08bcfa60a643fbb08ffdae9c1da8691", "bundled": true},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libtiff.6.dylib", "sha256": "0ba55c58c7d1af4fc36a6f45f723c358d8959be82f71e40d198a4ce498782e4e", "bundled": true},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libpng16.16.dylib", "sha256": "5259b37708087b4b44688129250a774cfb1af1240a18455db3fb78425e1e5d14", "bundled": true},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libjpeg.8.dylib", "sha256": "cd5ba141cfafc975adc5d38228f74eb8fee882b69f71b81eb746545293916b90", "bundled": true},
+    {"path": "/usr/lib/libz.1.dylib", "bundled": false},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/liblcms2.2.dylib", "sha256": "080a82d6f688efb6b0e1d62fe914a24cffb6a06e2b3e8ff67811f02fc86d3661", "bundled": true},
+    {"path": "/usr/lib/libSystem.B.dylib", "bundled": false},
+    {"path": "/usr/lib/libiconv.2.dylib", "bundled": false},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libidn.12.dylib", "sha256": "1aacf142a44f441150962423e1967c9371096bcc12b6be39227396cd0d43a4e4", "bundled": true},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libfontconfig.1.dylib", "sha256": "c70b769b872a9fb193193926f7a0de562c22064afd87d62b94b0c6d9219dc12e", "bundled": true},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libfreetype.6.dylib", "sha256": "5f05d345bd093c86e47196ea047936373964d8d78fabadb4a10e0f64e1b922ee", "bundled": true},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libopenjp2.7.dylib", "sha256": "3abb5428bc1d2abee83f2e1012f65460f4f78a80ef9f23f46dbe9e8afe365a02", "bundled": true},
+    {"path": "/usr/lib/libexpat.1.dylib", "bundled": false},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libtesseract.5.dylib", "sha256": "e1d0cd2e03c69ff8178c7ccbbbb4391083938a62c841548ec143180d6d81a7e0", "bundled": true},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libarchive.13.dylib", "sha256": "36ceb374e4a7c352b446a44e81459ba13a1cbfd2e05f98fda6058d166af53615", "bundled": true},
+    {"path": "/usr/lib/libcurl.4.dylib", "bundled": false},
+    {"path": "/usr/libexec/cups/filter/hp116w_gs_resources/lib/libleptonica.6.dylib", "sha256": "3496023849a43a659a4865abba10810b7ffe2c2161595ff4dcf734421e630b7e", "bundled": true},
+    {"path": "/usr/lib/libc++.1.dylib", "bundled": false}
+  ],
+  "validation": {
+    "binary_sha_matches_router_builtin": true,
+    "binary_sha_matches_production_config": true,
+    "binary_sha_matches_install_pin": true,
+    "all_non_system_direct_dependencies_are_under_resource_root": true,
+    "real_cups_sandbox_use_previously_observed": true,
+    "production_install_executed": false
+  }
+}

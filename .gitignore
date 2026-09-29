@@ -1,0 +1,51 @@
+# Track reviewed production source and documentation; leave local captures,
+# experiments, reference drivers, and print content on this Mac.
+.DS_Store
+__pycache__/
+*.py[cod]
+
+/analysis/*
+!/analysis/openprinting-gray-600/
+!/analysis/wps-docx-halftone-fix/
+
+/analysis/openprinting-gray-600/*
+!/analysis/openprinting-gray-600/FINAL_600_PRODUCTION_STATUS.md
+!/analysis/openprinting-gray-600/install-generic-600.sh
+
+/analysis/wps-docx-halftone-fix/*
+!/analysis/wps-docx-halftone-fix/FINAL_1200_PRODUCTION_STATUS.md
+!/analysis/wps-docx-halftone-fix/selective-halftone-design.md
+!/analysis/wps-docx-halftone-fix/wps-detector.md
+!/analysis/wps-docx-halftone-fix/600-cups-runtime-fix/
+!/analysis/wps-docx-halftone-fix/dev-queue-integration/
+!/analysis/wps-docx-halftone-fix/fixed-queues/
+!/analysis/wps-docx-halftone-fix/hp116w-smart-router-dev/
+!/analysis/wps-docx-halftone-fix/print-quality-validation/
+
+/analysis/wps-docx-halftone-fix/600-cups-runtime-fix/*
+!/analysis/wps-docx-halftone-fix/600-cups-runtime-fix/wheels/
+
+/analysis/wps-docx-halftone-fix/dev-queue-integration/*
+!/analysis/wps-docx-halftone-fix/dev-queue-integration/hp116w_wps_dispatcher.py
+
+/analysis/wps-docx-halftone-fix/fixed-queues/*
+!/analysis/wps-docx-halftone-fix/fixed-queues/README.md
+!/analysis/wps-docx-halftone-fix/fixed-queues/HP116W_600dpi.ppd
+!/analysis/wps-docx-halftone-fix/fixed-queues/HP116W_1200dpi.ppd
+
+/analysis/wps-docx-halftone-fix/print-quality-validation/*
+!/analysis/wps-docx-halftone-fix/print-quality-validation/analyze_spl3_capture.py
+
+# These PDFs came from print jobs; their content and metadata are not cleared
+# for upload. They are not required by the installed production chain.
+/analysis/wps-docx-halftone-fix/hp116w-smart-router-dev/test-fixtures/
+
+# Local-only recovery artifacts embed the original LAN endpoint and are
+# version-pinned to an older router/config revision.
+/analysis/wps-docx-halftone-fix/hp116w-smart-router-dev/install-production-smart-router.sh
+/analysis/wps-docx-halftone-fix/hp116w-smart-router-dev/rollback-production-smart-router.sh
+/analysis/wps-docx-halftone-fix/hp116w-smart-router-dev/production-manifest.json
+
+# The validated Ghostscript binary bundle remains locally available. Its
+# full redistribution provenance/source offer is not established for public Git.
+/analysis/wps-docx-halftone-fix/hp116w-smart-router-dev/production-runtime/ghostscript/

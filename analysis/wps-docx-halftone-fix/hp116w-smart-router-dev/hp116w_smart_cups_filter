@@ -1,0 +1,467 @@
+#!/usr/bin/python3
+"""CUPS terminal wrapper for the HP116W Smart Router.
+
+Apple CUPS treats each PPD filter as a terminal printer conversion and did not
+chain two cupsFilter2 entries during offline graph resolution. This wrapper
+applies page selection/order with the pinned pypdf runtime, preserves the
+router's PDF->CUPS-Raster contract, then invokes the unchanged device encoder
+exactly once as its second, fully buffered stage.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import datetime as dt
+from pathlib import Path
+
+
+RUNTIME_ROOT = Path(os.environ.get(
+    "HP116W_RUNTIME_ROOT",
+    "/Library/Application Support/HP116W/runtime",
+))
+SITE_PACKAGES = RUNTIME_ROOT / "site-packages"
+os.environ["PYTHONNOUSERSITE"] = "1"
+if SITE_PACKAGES.is_dir():
+    sys.path.insert(0, str(SITE_PACKAGES))
+
+from pypdf import PdfReader, PdfWriter
+
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG = ROOT / "smart-router-config.json"
+INSTALLED_FILTER_DIR = Path("/usr/libexec/cups/filter")
+RASTER_MAGICS = {b"RaSt", b"tSaR", b"RaS2", b"2SaR", b"RaS3", b"3SaR"}
+PAGE_OPTION_KEYS = {"page-set", "page-ranges", "outputorder", "reverse", "pagestackorder"}
+
+
+class WrapperError(RuntimeError):
+    pass
+
+
+class WrapperInterrupted(WrapperError):
+    def __init__(self, signum: int):
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
+
+
+def message(event: str, **fields: object) -> None:
+    print("HP116W_SMART_WRAPPER " + json.dumps({"event": event, **fields}, default=str),
+          file=sys.stderr, flush=True)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_config() -> tuple[Path, dict[str, object]]:
+    configured = os.environ.get("HP116W_SMART_CONFIG")
+    path = Path(configured or str(DEFAULT_CONFIG)).resolve()
+    if not path.is_file() and (
+        os.environ.get("HP116W_SMART_INSTALLED") == "1"
+        or ROOT == INSTALLED_FILTER_DIR
+    ):
+        return Path("/usr/libexec/cups/filter/hp116w_smart_cups_filter"), {
+            "schema": 1,
+            "profile": "production",
+            "_builtin": True,
+            "smart_router": "/usr/libexec/cups/filter/hp116w_smart_router",
+            "device_encoder": "/usr/libexec/cups/filter/rastertoqpdl",
+            "timeout_seconds": 180,
+            "enforce_hashes": True,
+            "sha256": {
+                "smart_router": "f91c01db85c9c15d2dc8d410cf36ae62382dbbc383f82d4d6036b31894baf37d",
+                "device_encoder": "d2929bac0adee4fda83bd601fa84c219cff5891a7ffaff3414f22a99101dd4e5",
+            },
+        }
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WrapperError(f"cannot load config: {exc}") from exc
+    if config.get("schema") != 1 or config.get("profile") not in {"production", "offline-test"}:
+        raise WrapperError("invalid smart router profile")
+    if (os.environ.get("HP116W_SMART_INSTALLED") == "1" or ROOT == INSTALLED_FILTER_DIR) and config.get("profile") != "production":
+        raise WrapperError("installed wrapper requires production profile")
+    return path, config
+
+
+def config_path(config_file: Path, config: dict[str, object], key: str) -> Path:
+    value = config.get(key)
+    if not isinstance(value, str) or not value:
+        raise WrapperError(f"missing config path: {key}")
+    path = Path(value)
+    if not path.is_absolute():
+        path = config_file.parent / path
+    return path.resolve()
+
+
+def validate_program(config_file: Path, config: dict[str, object], key: str) -> Path:
+    path = config_path(config_file, config, key)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise WrapperError(f"program is missing or non-executable: {key}={path}")
+    if config.get("enforce_hashes", False):
+        pins = config.get("sha256")
+        expected = pins.get(key) if isinstance(pins, dict) else None
+        actual = sha256(path)
+        if expected != actual:
+            raise WrapperError(f"hash mismatch: {key} expected={expected} actual={actual}")
+    return path
+
+
+def spool_stdin(destination: Path) -> None:
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as output:
+        while True:
+            chunk = sys.stdin.buffer.read(1024 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    if destination.stat().st_size == 0:
+        raise WrapperError("empty PDF input")
+
+
+def terminate(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def relay(path: Path) -> None:
+    if path.is_file():
+        sys.stderr.buffer.write(path.read_bytes())
+        sys.stderr.buffer.flush()
+
+
+def run_stage(command: list[str], environment: dict[str, str], output: Path,
+              error: Path, timeout: float) -> None:
+    process: subprocess.Popen[bytes] | None = None
+    handlers: dict[int, object] = {}
+
+    def interrupted(signum: int, _frame: object) -> None:
+        raise WrapperInterrupted(signum)
+
+    try:
+        with output.open("xb") as stdout_stream, error.open("xb") as stderr_stream:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_stream,
+                stderr=stderr_stream,
+                env=environment,
+                close_fds=True,
+                start_new_session=True,
+            )
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, interrupted)
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                terminate(process)
+                raise WrapperError(f"stage timeout after {timeout:g}s") from exc
+            except WrapperInterrupted:
+                terminate(process)
+                raise
+        relay(error)
+        if returncode != 0:
+            raise WrapperError(f"stage exited with status {returncode}")
+    finally:
+        if process is not None and process.poll() is None:
+            terminate(process)
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)  # type: ignore[arg-type]
+
+
+def require_raster(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size <= 4 or path.read_bytes()[:4] not in RASTER_MAGICS:
+        raise WrapperError("router did not produce a valid CUPS Raster stream")
+
+
+def require_pdf(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size <= 5 or path.read_bytes()[:5] != b"%PDF-":
+        raise WrapperError("pypdf did not produce a valid PDF")
+
+
+def strip_page_options(options: str) -> tuple[str, list[str]]:
+    """Remove page selection/order options after local PDF pagination."""
+    try:
+        tokens = shlex.split(options, posix=True)
+    except ValueError as exc:
+        raise WrapperError(f"cannot parse CUPS options: {exc}") from exc
+    kept: list[str] = []
+    removed: list[str] = []
+    for token in tokens:
+        name = token.split("=", 1)[0].lower()
+        if name in PAGE_OPTION_KEYS:
+            removed.append(token)
+        else:
+            kept.append(token)
+    return shlex.join(kept), removed
+
+
+PAGE_RANGE_RE = re.compile(r"^([0-9]+)?-([0-9]+)?$")
+
+
+def _option_tokens(options: str) -> list[tuple[str, str | None]]:
+    try:
+        tokens = shlex.split(options, posix=True)
+    except ValueError as exc:
+        raise WrapperError(f"cannot parse CUPS options: {exc}") from exc
+    parsed: list[tuple[str, str | None]] = []
+    for token in tokens:
+        name, separator, value = token.partition("=")
+        parsed.append((name.lower(), value if separator else None))
+    return parsed
+
+
+def _parse_page_ranges(spec: str, page_count: int) -> list[int]:
+    selected: list[int] = []
+    for item in spec.split(","):
+        item = item.strip()
+        match = PAGE_RANGE_RE.fullmatch(item)
+        if match is None:
+            raise WrapperError(f"invalid page-ranges: {spec}")
+        first = int(match.group(1) or 1)
+        last = int(match.group(2) or page_count)
+        if first < 1 or last < first or last > page_count:
+            raise WrapperError(f"page-ranges outside 1..{page_count}: {spec}")
+        for number in range(first, last + 1):
+            index = number - 1
+            if index not in selected:
+                selected.append(index)
+    if not selected:
+        raise WrapperError(f"empty page-ranges: {spec}")
+    return selected
+
+
+def select_pages(options: str, input_pdf: Path, output_pdf: Path) -> tuple[Path, dict[str, object]]:
+    """Apply CUPS page selection/order once without rasterizing or normalizing."""
+    tokens = _option_tokens(options)
+    reader = PdfReader(str(input_pdf), strict=False)
+    page_count = len(reader.pages)
+    if page_count < 1:
+        raise WrapperError("PDF has no pages")
+
+    range_spec: str | None = None
+    page_set = "all"
+    reverse = False
+    for name, value in tokens:
+        normalized = (value or "").strip().strip('"').lower()
+        if name == "page-ranges":
+            range_spec = normalized
+        elif name == "page-set" and normalized:
+            page_set = normalized
+        elif name in {"outputorder", "pagestackorder"} and normalized:
+            if normalized in {"reverse", "reversed", "reverseorder", "reverse-order"}:
+                reverse = True
+            elif normalized in {"normal", "forward", "normalorder", "normal-order"}:
+                reverse = False
+        elif name == "reverse":
+            reverse = value is None or normalized in {"1", "true", "yes", "on", "reverse"}
+
+    selected = _parse_page_ranges(range_spec, page_count) if range_spec else list(range(page_count))
+    if page_set not in {"all", "odd", "even"}:
+        raise WrapperError(f"unsupported page-set: {page_set}")
+    if page_set != "all":
+        parity = 1 if page_set == "odd" else 0
+        selected = [index for index in selected if (index + 1) % 2 == parity]
+    if not selected:
+        raise WrapperError("page selection produced no pages")
+    if reverse:
+        selected.reverse()
+
+    identity = selected == list(range(page_count))
+    record = {
+        "processor": "pypdf",
+        "input_page_count": page_count,
+        "page_ranges": range_spec,
+        "page_set": page_set,
+        "reverse": reverse,
+        "selected_source_pages": [index + 1 for index in selected],
+        "output_page_count": len(selected),
+        "rewritten": not identity,
+    }
+    if identity:
+        return input_pdf, record
+
+    writer = PdfWriter()
+    if reader.metadata:
+        writer.add_metadata({str(key): str(value) for key, value in reader.metadata.items() if value is not None})
+    for index in selected:
+        writer.add_page(reader.pages[index])
+    with output_pdf.open("wb") as stream:
+        writer.write(stream)
+    require_pdf(output_pdf)
+    return output_pdf, record
+
+
+def require_spl3(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise WrapperError("device encoder produced empty output")
+    data = path.read_bytes()
+    if not data.startswith(b"\x1b%-12345X") or b"ENTER LANGUAGE = QPDL" not in data:
+        raise WrapperError("device encoder produced invalid SPL3/PJL framing")
+
+
+def commit(path: Path) -> None:
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            sys.stdout.buffer.write(chunk)
+    sys.stdout.buffer.flush()
+
+
+def atomic_report(job_id: str, record: dict[str, object]) -> Path:
+    root = Path(os.environ.get(
+        "HP116W_SMART_WRAPPER_LOG_DIR",
+        "/private/var/spool/cups/tmp/hp116w-smart-wrapper-logs",
+    ))
+    root.mkdir(parents=True, exist_ok=True)
+    safe_job = "".join(c if c.isalnum() or c in "_.-" else "_" for c in job_id) or "unknown"
+    destination = root / f"job-{safe_job}.json"
+    fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=root)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def main() -> int:
+    arguments = sys.argv[1:]
+    if len(arguments) not in {5, 6}:
+        message("WRAPPER_ABORT", reason="expected five or six CUPS filter arguments")
+        return 2
+    try:
+        config_file, config = load_config()
+        if config.get("enforce_hashes", False):
+            pins = config.get("sha256")
+            if not config.get("_builtin"):
+                expected_self = pins.get("cups_wrapper") if isinstance(pins, dict) else None
+                actual_self = sha256(Path(__file__).resolve())
+                if expected_self != actual_self:
+                    raise WrapperError(
+                        f"hash mismatch: cups_wrapper expected={expected_self} actual={actual_self}"
+                    )
+        router = validate_program(config_file, config, "smart_router")
+        encoder = validate_program(config_file, config, "device_encoder")
+        timeout = float(os.environ.get(
+            "HP116W_SMART_WRAPPER_TIMEOUT_SECONDS",
+            str(config.get("wrapper_timeout_seconds", config.get("timeout_seconds", 180))),
+        ))
+        if timeout <= 0:
+            raise WrapperError("wrapper timeout must be positive")
+        with tempfile.TemporaryDirectory(prefix="hp116w-smart-cups-filter-") as temporary:
+            work = Path(temporary)
+            if len(arguments) == 6 and arguments[5] not in {"", "-"}:
+                pdf = Path(arguments[5])
+                if not pdf.is_file() or pdf.stat().st_size == 0:
+                    raise WrapperError(f"missing or empty PDF input: {pdf}")
+            else:
+                pdf = work / "input.pdf"
+                spool_stdin(pdf)
+            received_options = arguments[4] or ""
+            downstream_options, removed_page_options = strip_page_options(received_options)
+            environment = os.environ.copy()
+            if config.get("_builtin"):
+                # The three-file install deliberately has no JSON config.
+                # Tell the child router to select its own installed-mode
+                # constants; never pass this wrapper script as a JSON path.
+                environment.pop("HP116W_SMART_CONFIG", None)
+                environment["HP116W_SMART_INSTALLED"] = "1"
+            else:
+                environment["HP116W_SMART_CONFIG"] = str(config_file)
+
+            preprocessed = work / "page-processed.pdf"
+            message("PAGE_PROCESSOR_START", job_id=arguments[0],
+                    processor="pypdf", options=received_options)
+            processed_pdf, page_record = select_pages(received_options, pdf, preprocessed)
+            normalized = [*arguments[:4], downstream_options, str(preprocessed)]
+            normalized[-1] = str(processed_pdf)
+            message("PAGE_PROCESSOR_DONE", job_id=arguments[0],
+                    processor="pypdf", removed=removed_page_options,
+                    input_pdf_sha256=sha256(pdf), output_pdf_sha256=sha256(processed_pdf),
+                    output_pdf_bytes=processed_pdf.stat().st_size,
+                    selected_source_pages=page_record["selected_source_pages"],
+                    rewritten=page_record["rewritten"])
+
+            raster = work / "router.raster"
+            router_error = work / "router.stderr"
+            message("ROUTER_STAGE_START", job_id=arguments[0])
+            run_stage([str(router), *normalized], environment, raster, router_error, timeout)
+            require_raster(raster)
+
+            spl3 = work / "encoded.spl"
+            encoder_error = work / "encoder.stderr"
+            message("ENCODER_START", job_id=arguments[0], invocation=1)
+            run_stage([str(encoder), *normalized[:5], str(raster)], environment,
+                      spl3, encoder_error, timeout)
+            require_spl3(spl3)
+            wrapper_report = atomic_report(arguments[0], {
+                "schema": 1,
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "job_id": arguments[0],
+                "status": "PASS",
+                "page_processor": "pypdf",
+                "page_options_received": received_options,
+                "page_options_removed": removed_page_options,
+                "downstream_options": downstream_options,
+                "page_selection": page_record,
+                "preprocessed_pdf_bytes": processed_pdf.stat().st_size,
+                "preprocessed_pdf_sha256": sha256(processed_pdf),
+                "router_raster_bytes": raster.stat().st_size,
+                "router_raster_sha256": sha256(raster),
+                "encoder": str(encoder),
+                "encoder_invocations": 1,
+                "spl3_bytes": spl3.stat().st_size,
+                "spl3_sha256": sha256(spl3),
+                "network_sent": False,
+            })
+            message("OUTPUT_VALIDATED", job_id=arguments[0], bytes=spl3.stat().st_size,
+                    sha256=sha256(spl3), encoder_invocations=1,
+                    report=str(wrapper_report))
+            commit(spl3)
+        return 0
+    except WrapperInterrupted as exc:
+        message("WRAPPER_ABORT", reason=str(exc))
+        return 128 + exc.signum
+    except Exception as exc:
+        message("WRAPPER_ABORT", reason=f"{type(exc).__name__}: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
